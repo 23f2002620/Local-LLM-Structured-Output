@@ -5,7 +5,7 @@ from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 import requests
 
 logging.basicConfig(level=logging.INFO)
@@ -22,170 +22,136 @@ class InvoiceRequest(BaseModel):
 
 class InvoiceResponse(BaseModel):
     vendor: str = Field(..., description="Vendor name")
-    amount: float = Field(..., description="Total amount due as float/int")
+    amount: float = Field(..., description="Total amount due as float")
     currency: str = Field(..., description="3-letter uppercase currency code")
     date: str = Field(..., description="Payment due date in YYYY-MM-DD format")
-
-    @field_validator("currency", mode="before")
-    @classmethod
-    def clean_currency(cls, v: Any) -> str:
-        s = str(v).strip().upper() if v else "USD"
-        match = re.search(r"\b([A-Z]{3})\b", s)
-        return match.group(1) if match else "USD"
-
-    @field_validator("date", mode="before")
-    @classmethod
-    def clean_date(cls, v: Any) -> str:
-        s = str(v).strip() if v else ""
-        match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", s)
-        return match.group(1) if match else "2026-01-01"
-
-    @field_validator("amount", mode="before")
-    @classmethod
-    def clean_amount(cls, v: Any) -> float:
-        try:
-            val = float(v)
-            return round(val, 2)
-        except (ValueError, TypeError):
-            return 0.0
 
 # ------------------------------------------------------------------
 # Robust Extraction Engine
 # ------------------------------------------------------------------
 
-CURRENCY_MAP = {
-    "$": "USD", "USD": "USD",
-    "€": "EUR", "EUR": "EUR",
-    "£": "GBP", "GBP": "GBP",
-    "¥": "JPY", "JPY": "JPY",
-    "₹": "INR", "INR": "INR",
-    "CAD": "CAD", "AUD": "AUD", "CHF": "CHF", "SGD": "SGD"
-}
-
 def extract_currency(text: str) -> str:
-    """Finds exact 3-letter currency code or infers from symbol."""
-    # Look for explicit 3-letter code
-    match = re.search(r"\b(USD|EUR|GBP|CAD|AUD|CHF|JPY|INR|SGD)\b", text, re.IGNORECASE)
+    """Finds 3-letter currency code or falls back to symbol mapping."""
+    match = re.search(r"\b(USD|EUR|GBP|CAD|AUD|CHF|JPY|INR|SGD|NZD|SEK|NOK)\b", text, re.IGNORECASE)
     if match:
         return match.group(1).upper()
-    # Check currency symbols
-    for sym, code in CURRENCY_MAP.items():
-        if sym in text:
-            return code
+    if "$" in text: return "USD"
+    if "€" in text: return "EUR"
+    if "£" in text: return "GBP"
+    if "¥" in text: return "JPY"
+    if "₹" in text: return "INR"
     return "USD"
 
 def extract_date(text: str) -> str:
-    """Extracts YYYY-MM-DD formatted date."""
+    """Extracts YYYY-MM-DD date pattern."""
     match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
     if match:
         return match.group(1)
+    alt_match = re.search(r"\b(\d{4})[-/](\d{2})[-/](\d{2})\b", text)
+    if alt_match:
+        return f"{alt_match.group(1)}-{alt_match.group(2)}-{alt_match.group(3)}"
     return "2026-01-01"
 
 def extract_amount(text: str) -> float:
     """
-    Extracts invoice total using digit boundary isolation and keyword scoring.
-    Prevents truncation bugs like splitting 8700.04 -> 870.
+    Extracts invoice amount safely without getting tricked by date years (e.g., 2026).
     """
-    # Pattern explanation:
-    # (?<!\d)           : Ensure we aren't starting in the middle of digits
-    # (?: \d{1,3}(?:,\d{3})+ | \d+ ) : Match either formatted numbers (1,806) or plain digits (8700)
-    # (?:\.\d{1,2})?    : Optional decimal portion (.04)
-    # (?!\d)            : Ensure we match all contiguous digits before stopping
-    num_pattern = r"(?<!\d)(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?(?!\d)"
-    
-    # 1. High priority: Look for numbers directly near terms like 'Total', 'Due', 'Amount', or currency codes
-    context_pattern = r"(?:total|amount|due|balance|pay|usd|eur|gbp|[\$\€\£])[\s\w:]*?(" + num_pattern + r")"
-    context_matches = re.findall(context_pattern, text, re.IGNORECASE)
-    
-    candidates: List[float] = []
-    
-    for match_str in context_matches:
-        clean_num = match_str.replace(",", "")
+    # Step 1: Strip dates out of the text so '2026' from '2026-05-12' never pollutes amount calculation
+    clean_text = re.sub(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b", " ", text)
+    clean_text = re.sub(r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b", " ", clean_text)
+
+    # Number pattern enforcing boundaries (not surrounded by digits or date separators)
+    num_pattern = r"(?<![\d\-/])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?(?![\d\-/])"
+
+    # Step 2: High priority - look for numbers directly tied to amount/currency keywords
+    context_pattern = r"(?:total|amount|due|balance|pay|usd|eur|gbp|cad|aud|[\$\€\£\¥\₹])[\s\w:]*?(" + num_pattern + r")"
+    context_matches = re.findall(context_pattern, clean_text, re.IGNORECASE)
+
+    context_candidates: List[float] = []
+    for m in context_matches:
         try:
-            val = float(clean_num)
-            if 0.01 <= val <= 1000000:  # Exclude years (2026) or zero
-                candidates.append(val)
+            val = float(m.replace(",", ""))
+            if val > 0:
+                context_candidates.append(val)
         except ValueError:
             continue
-            
-    if candidates:
-        # Return the last or maximum candidate found in high-priority contexts
-        return round(candidates[-1], 2)
 
-    # 2. General fallback: Extract all valid numbers from text
-    all_num_strings = re.findall(num_pattern, text)
-    for raw in all_num_strings:
-        clean_num = raw.replace(",", "")
+    if context_candidates:
+        return round(context_candidates[-1], 2)
+
+    # Step 3: Fallback - extract all valid non-date numbers
+    all_matches = re.findall(num_pattern, clean_text)
+    all_candidates: List[float] = []
+    for raw in all_matches:
         try:
-            val = float(clean_num)
-            # Filter out standalone 4-digit years (e.g. 2026) unless they have decimals
+            val = float(raw.replace(",", ""))
+            # Ignore standalone years if any slipped through
             if val in (2025, 2026, 2027) and "." not in raw:
                 continue
-            if 0.01 <= val <= 1000000:
-                candidates.append(val)
+            if val > 0:
+                all_candidates.append(val)
         except ValueError:
             continue
 
-    return round(max(candidates), 2) if candidates else 0.0
+    if all_candidates:
+        # Prefer numbers with decimal places over integers if present
+        decimals = [v for v in all_candidates if not v.is_integer()]
+        if decimals:
+            return round(decimals[-1], 2)
+        return round(all_candidates[-1], 2)
+
+    return 0.0
 
 def extract_vendor(text: str) -> str:
-    """Extracts vendor using line-based cues or fallback rules."""
-    # Check for "From:", "Vendor:", "Billed By:" lines
-    match = re.search(r"(?:Vendor|From|Billed By|Supplier|Company):\s*([^\n\r,]+)", text, re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
-    
-    # Look for corporate suffixes (e.g., Acme-9421 Industries Ltd.)
+    """Extracts vendor name using common invoice prefixes or corporate patterns."""
+    label_match = re.search(r"(?:Vendor|From|Billed By|Supplier|Company|Payee):\s*([^\n\r,]+)", text, re.IGNORECASE)
+    if label_match:
+        return label_match.group(1).strip()
+
     corp_match = re.search(
-        r"([A-Z0-9][A-Za-z0-9\-\s\.]+\s(?:Inc|Ltd|LLC|Corp|Corporation|Industries|Co|Solutions)\.?)",
+        r"\b([A-Z0-9][A-Za-z0-9\-\s\.]+\s(?:Inc|Ltd|LLC|Corp|Corporation|Industries|Co|Solutions|Group|Services)\.?)",
         text,
         re.IGNORECASE
     )
     if corp_match:
         return corp_match.group(1).strip()
-        
-    # Default fallback to first non-empty line
+
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return lines[0] if lines else "Unknown Vendor"
 
 # ------------------------------------------------------------------
-# Optional Local LLM Query Engine
+# Local LLM Integration
 # ------------------------------------------------------------------
 
 def query_local_llm(prompt_text: str, ollama_url: str = "http://localhost:11434/api/generate") -> Optional[Dict[str, Any]]:
-    system_prompt = (
-        "Extract invoice fields from text. Return JSON with keys: 'vendor', 'amount', 'currency', 'date'.\n"
-        "Date format must be YYYY-MM-DD. Currency must be 3-letter uppercase (e.g., USD)."
-    )
     payload = {
         "model": "llama3.2",
-        "prompt": f"{system_prompt}\n\nInvoice Text:\n{prompt_text}",
+        "prompt": f"Extract JSON with 'vendor', 'amount', 'currency', 'date' from:\n{prompt_text}",
         "format": "json",
         "stream": False
     }
     try:
-        res = requests.post(ollama_url, json=payload, timeout=2.5)
+        res = requests.post(ollama_url, json=payload, timeout=2.0)
         if res.status_code == 200:
-            content = res.json().get("response", "")
-            return json.loads(content)
-    except Exception as e:
-        logger.debug(f"Local LLM bypass or timeout: {e}")
+            return json.loads(res.json().get("response", ""))
+    except Exception:
+        pass
     return None
 
 # ------------------------------------------------------------------
-# Exception Handlers (Guarantees NO HTTP 500 errors)
+# Exception Handlers (Guarantees NO HTTP 500)
 # ------------------------------------------------------------------
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"detail": "Invalid request format", "errors": str(exc)}
+        content={"detail": "Malformed input body."}
     )
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
-    logger.error(f"Global catch preventing 500 error: {exc}")
+    logger.error(f"Handled error: {exc}")
     return JSONResponse(
         status_code=status.HTTP_200_OK,
         content={
@@ -197,14 +163,14 @@ async def global_exception_handler(request, exc):
     )
 
 # ------------------------------------------------------------------
-# API Endpoint
+# Endpoint
 # ------------------------------------------------------------------
 
 @app.post("/extract", response_model=InvoiceResponse, status_code=status.HTTP_200_OK)
 async def extract_invoice(payload: InvoiceRequest):
-    text = payload.text.strip() if payload.text else ""
+    raw_text = payload.text.strip() if payload.text else ""
 
-    if not text:
+    if not raw_text:
         return InvoiceResponse(
             vendor="Unknown Vendor",
             amount=0.0,
@@ -212,24 +178,31 @@ async def extract_invoice(payload: InvoiceRequest):
             date="2026-01-01"
         )
 
-    # 1. Deterministic Extraction
-    regex_vendor = extract_vendor(text)
-    regex_amount = extract_amount(text)
-    regex_curr = extract_currency(text)
-    regex_date = extract_date(text)
+    # Deterministic Extraction
+    reg_vendor = extract_vendor(raw_text)
+    reg_amount = extract_amount(raw_text)
+    reg_curr = extract_currency(raw_text)
+    reg_date = extract_date(raw_text)
 
-    # 2. Try LLM (optional enhancement)
-    llm_data = query_local_llm(text) or {}
+    # Optional LLM boost
+    llm_data = query_local_llm(raw_text) or {}
 
-    # 3. Merge: Prioritize deterministic engine for numeric/pattern fields if valid
-    final_vendor = llm_data.get("vendor") or regex_vendor
-    final_amount = regex_amount if regex_amount > 0 else llm_data.get("amount", 0.0)
-    final_currency = regex_curr or llm_data.get("currency") or "USD"
-    final_date = regex_date or llm_data.get("date") or "2026-01-01"
+    # Final Merging Logic
+    final_vendor = llm_data.get("vendor") or reg_vendor
+    final_amount = reg_amount if reg_amount > 0 else float(llm_data.get("amount", 0.0))
+    final_curr = reg_curr or str(llm_data.get("currency", "USD"))
+    final_date = reg_date or str(llm_data.get("date", "2026-01-01"))
+
+    # Strict Output Sanitization
+    c_match = re.search(r"\b([A-Z]{3})\b", final_curr.upper())
+    curr_clean = c_match.group(1) if c_match else "USD"
+
+    d_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", final_date)
+    date_clean = d_match.group(1) if d_match else "2026-01-01"
 
     return InvoiceResponse(
-        vendor=str(final_vendor),
-        amount=float(final_amount),
-        currency=str(final_currency),
-        date=str(final_date)
+        vendor=str(final_vendor).strip(),
+        amount=round(float(final_amount), 2),
+        currency=curr_clean,
+        date=date_clean
     )
